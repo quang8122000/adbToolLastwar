@@ -1,0 +1,2 @@
+# Không cần thư viện bên ngoài, chỉ sử dụng thư viện chuẩn của Python
+# Python 3.6+ required
