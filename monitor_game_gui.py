@@ -88,6 +88,36 @@ class GameMonitorGUI:
         self.interval_entry.insert(0, "2")
         self.interval_entry.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
 
+        # Click speed
+        tk.Label(config_frame, text="Click Speed (ms):", font=("SF Pro", 10)).grid(
+            row=3, column=0, sticky=tk.W, padx=10, pady=5
+        )
+        self.click_speed_entry = tk.Entry(config_frame, width=10, font=("SF Mono", 10))
+        self.click_speed_entry.insert(0, "70")
+        self.click_speed_entry.grid(row=3, column=1, sticky=tk.W, padx=10, pady=5)
+        tk.Label(
+            config_frame,
+            text="(Khuyến nghị: 50-100ms)",
+            font=("SF Pro", 8),
+            fg="#7f8c8d",
+        ).grid(row=3, column=2, sticky=tk.W, padx=5, pady=5)
+
+        # Click duration
+        tk.Label(config_frame, text="Click Duration (s):", font=("SF Pro", 10)).grid(
+            row=4, column=0, sticky=tk.W, padx=10, pady=5
+        )
+        self.click_duration_entry = tk.Entry(
+            config_frame, width=10, font=("SF Mono", 10)
+        )
+        self.click_duration_entry.insert(0, "10")
+        self.click_duration_entry.grid(row=4, column=1, sticky=tk.W, padx=10, pady=5)
+        tk.Label(
+            config_frame,
+            text="(Thời gian click liên tục ở bước 5)",
+            font=("SF Pro", 8),
+            fg="#7f8c8d",
+        ).grid(row=4, column=2, sticky=tk.W, padx=5, pady=5)
+
         # OCR Region config
         ocr_frame = tk.LabelFrame(
             self.root, text="📦 OCR Region (hỗ trợ %, px)", font=("SF Pro", 12, "bold")
@@ -158,6 +188,98 @@ class GameMonitorGUI:
             variable=self.debug_var,
             font=("SF Pro", 10),
         ).pack(anchor=tk.W, padx=10, pady=2)
+
+        # Manual Control Frame
+        manual_frame = tk.LabelFrame(
+            self.root, text="🎮 Điều khiển thủ công", font=("SF Pro", 12, "bold")
+        )
+        manual_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        # Row 1: Steps 1-3
+        manual_row1 = tk.Frame(manual_frame)
+        manual_row1.pack(fill=tk.X, padx=5, pady=5)
+
+        self.step1_btn = tk.Button(
+            manual_row1,
+            text="1️⃣ Click Treasure",
+            command=self.manual_step1,
+            bg="#3498db",
+            fg="white",
+            font=("SF Pro", 10, "bold"),
+            width=15,
+            relief=tk.RAISED,
+            cursor="hand2",
+        )
+        self.step1_btn.pack(side=tk.LEFT, padx=5)
+
+        self.step2_btn = tk.Button(
+            manual_row1,
+            text="2️⃣ Click Center",
+            command=self.manual_step2,
+            bg="#3498db",
+            fg="white",
+            font=("SF Pro", 10, "bold"),
+            width=15,
+            relief=tk.RAISED,
+            cursor="hand2",
+        )
+        self.step2_btn.pack(side=tk.LEFT, padx=5)
+
+        self.step3_btn = tk.Button(
+            manual_row1,
+            text="3️⃣ Verify & Click",
+            command=self.manual_step3,
+            bg="#3498db",
+            fg="white",
+            font=("SF Pro", 10, "bold"),
+            width=15,
+            relief=tk.RAISED,
+            cursor="hand2",
+        )
+        self.step3_btn.pack(side=tk.LEFT, padx=5)
+
+        # Row 2: Steps 4-5 + Reset
+        manual_row2 = tk.Frame(manual_frame)
+        manual_row2.pack(fill=tk.X, padx=5, pady=5)
+
+        self.step4_btn = tk.Button(
+            manual_row2,
+            text="4️⃣ Verify & Click",
+            command=self.manual_step4,
+            bg="#3498db",
+            fg="white",
+            font=("SF Pro", 10, "bold"),
+            width=15,
+            relief=tk.RAISED,
+            cursor="hand2",
+        )
+        self.step4_btn.pack(side=tk.LEFT, padx=5)
+
+        self.step5_btn = tk.Button(
+            manual_row2,
+            text="5️⃣ Auto Click",
+            command=self.manual_step5,
+            bg="#3498db",
+            fg="white",
+            font=("SF Pro", 10, "bold"),
+            width=15,
+            relief=tk.RAISED,
+            cursor="hand2",
+        )
+        self.step5_btn.pack(side=tk.LEFT, padx=5)
+
+        self.reset_btn = tk.Button(
+            manual_row2,
+            text="🔄 Reset",
+            command=self.manual_reset,
+            bg="#f39c12",
+            fg="white",
+            font=("SF Pro", 10, "bold"),
+            width=15,
+            relief=tk.RAISED,
+            cursor="hand2",
+        )
+        self.reset_btn.pack(side=tk.LEFT, padx=5)
 
         # Control buttons
         control_frame = tk.Frame(self.root)
@@ -230,6 +352,13 @@ class GameMonitorGUI:
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
+        # Configure log text tags for colored output
+        self.log_text.tag_config("success", foreground="#27ae60")
+        self.log_text.tag_config("error", foreground="#e74c3c")
+        self.log_text.tag_config("warning", foreground="#f39c12")
+        self.log_text.tag_config("info", foreground="#3498db")
+        self.log_text.tag_config("action", foreground="#9b59b6")
+
         # Redirect stdout to log
         sys.stdout = TextRedirector(self.log_text, "stdout")
 
@@ -238,11 +367,36 @@ class GameMonitorGUI:
         self.log("📱 Hãy đảm bảo thiết bị Android đã kết nối qua ADB\n")
 
     def log(self, message):
-        """Log message to text area"""
+        """Log message to text area with color coding"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        full_message = f"[{timestamp}] {message}"
+
+        # Determine log type based on emoji/keyword
+        log_type = "normal"
+        if any(
+            x in message for x in ["✅", "Hoàn thành", "thành công", "khớp", "Tìm thấy"]
+        ):
+            log_type = "success"
+        elif any(
+            x in message for x in ["❌", "Lỗi", "Error", "thất bại", "không khớp"]
+        ):
+            log_type = "error"
+        elif any(x in message for x in ["⚠️", "Warning", "Cảnh báo", "Bỏ qua"]):
+            log_type = "warning"
+        elif any(x in message for x in ["🔍", "Kiểm tra", "Check", "Debug"]):
+            log_type = "info"
+        elif any(x in message for x in ["🎯", "👆", "Click", "Bước"]):
+            log_type = "action"
+
+        # Insert with appropriate tag color
+        self.log_text.insert(tk.END, full_message + "\n", log_type)
         self.log_text.see(tk.END)
         self.root.update()
+
+    def clear_log(self):
+        """Clear log text"""
+        self.log_text.delete(1.0, tk.END)
+        self.log("🗑️  Log đã được xóa\n")
 
     def save_config(self):
         """Lưu config vào file JSON"""
@@ -250,6 +404,8 @@ class GameMonitorGUI:
             "package_name": self.package_entry.get(),
             "target_texts": self.target_entry.get(),
             "check_interval": self.interval_entry.get(),
+            "click_speed": self.click_speed_entry.get(),
+            "click_duration": self.click_duration_entry.get(),
             "auto_click": self.auto_click_var.get(),
             "debug": self.debug_var.get(),
             "ocr_region": {
@@ -289,6 +445,14 @@ class GameMonitorGUI:
                 self.interval_entry.delete(0, tk.END)
                 self.interval_entry.insert(0, config["check_interval"])
 
+            if "click_speed" in config:
+                self.click_speed_entry.delete(0, tk.END)
+                self.click_speed_entry.insert(0, config["click_speed"])
+
+            if "click_duration" in config:
+                self.click_duration_entry.delete(0, tk.END)
+                self.click_duration_entry.insert(0, config["click_duration"])
+
             if "auto_click" in config:
                 self.auto_click_var.set(config["auto_click"])
 
@@ -316,6 +480,7 @@ class GameMonitorGUI:
     def clear_log(self):
         """Clear log text"""
         self.log_text.delete(1.0, tk.END)
+        self.all_logs = []  # Clear stored logs too
         self.log("🗑️  Log đã được xóa\n")
 
     def preview_region(self):
@@ -420,6 +585,10 @@ class GameMonitorGUI:
         package = self.package_entry.get().strip()
         target_texts = [t.strip() for t in self.target_entry.get().split(",")]
         interval = float(self.interval_entry.get())
+        click_speed = (
+            float(self.click_speed_entry.get()) / 1000.0
+        )  # Convert ms to seconds
+        click_duration = float(self.click_duration_entry.get())  # Duration in seconds
         auto_click = self.auto_click_var.get()
         debug = self.debug_var.get()
 
@@ -446,6 +615,8 @@ class GameMonitorGUI:
         self.package_entry.config(state=tk.DISABLED)
         self.target_entry.config(state=tk.DISABLED)
         self.interval_entry.config(state=tk.DISABLED)
+        self.click_speed_entry.config(state=tk.DISABLED)
+        self.click_duration_entry.config(state=tk.DISABLED)
         self.preview_btn.config(state=tk.DISABLED)
 
         self.is_running = True
@@ -456,9 +627,17 @@ class GameMonitorGUI:
 
         # Pixel patterns
         PIXEL_PATTERNS = {
-            "step3": [
+            "step3_dig": [  # Pattern cho "Dig Up Treasure"
                 {"coord": (550, 1136), "color": "#FFFFFF"},
                 {"coord": (545, 1136), "color": "#F8FBF9"},
+            ],
+            "step3_test": [  # Pattern cho "Test Flight Failure"
+                {"coord": (550, 1136), "color": "#FFFFFF"},
+                {"coord": (545, 1136), "color": "#308E4D"},  # Màu khác
+            ],
+            "step3_tiec": [  # Pattern cho "Wondrous Christmas Party"
+                {"coord": (552, 1723), "color": "#FFFFFF"},  # Pixel chính
+                {"coord": (547, 1723), "color": "#FFFFFF"},  # Trái
             ],
             "step4": [
                 {"coord": (542, 1472), "color": "#10B1FB"},
@@ -478,6 +657,8 @@ class GameMonitorGUI:
             debug=debug,
             auto_click=auto_click,
             click_delay=0.2,
+            click_speed=click_speed,
+            click_duration=click_duration,
             skip_color_check=True,
             ocr_region=ocr_region,
             pixel_patterns=PIXEL_PATTERNS,
@@ -516,8 +697,138 @@ class GameMonitorGUI:
         self.package_entry.config(state=tk.NORMAL)
         self.target_entry.config(state=tk.NORMAL)
         self.interval_entry.config(state=tk.NORMAL)
+        self.click_speed_entry.config(state=tk.NORMAL)
+        self.click_duration_entry.config(state=tk.NORMAL)
         self.preview_btn.config(state=tk.NORMAL)
         self.status_label.config(text="⏸️  Đang chờ...", fg="#7f8c8d")
+
+    def create_manual_monitor(self):
+        """Tạo monitor instance cho manual control nếu chưa có"""
+        if self.monitor is None:
+            package = self.package_entry.get().strip()
+            target_texts = [t.strip() for t in self.target_entry.get().split(",")]
+            click_speed = float(self.click_speed_entry.get()) / 1000.0
+            click_duration = float(self.click_duration_entry.get())
+            debug = self.debug_var.get()
+
+            ocr_region = {
+                "top": self.top_entry.get().strip() or "0",
+                "left": self.left_entry.get().strip() or "0",
+                "width": self.width_entry.get().strip() or "100%",
+                "height": self.height_entry.get().strip() or "100%",
+            }
+
+            PIXEL_PATTERNS = {
+                "step3": [
+                    {"coord": (550, 1136), "color": "#FFFFFF"},
+                    {"coord": (545, 1136), "color": "#F8FBF9"},
+                ],
+                "step4": [
+                    {"coord": (542, 1472), "color": "#10B1FB"},
+                    {"coord": (537, 1472), "color": "#10B2FC"},
+                ],
+                "step5": [
+                    {"coord": (514, 819), "color": "#94C03D"},
+                    {"coord": (509, 819), "color": "#A7F200"},
+                ],
+            }
+
+            self.monitor = GameMonitor(
+                package,
+                target_texts,
+                use_ocr=True,
+                debug=debug,
+                auto_click=False,
+                click_delay=0.2,
+                click_speed=click_speed,
+                click_duration=click_duration,
+                skip_color_check=True,
+                ocr_region=ocr_region,
+                pixel_patterns=PIXEL_PATTERNS,
+                pattern_tolerance=20,
+                pattern_match_ratio=0.6,
+            )
+
+        # Reset stop flag trước khi chạy manual steps
+        self.monitor.stop_requested = False
+
+    def manual_step1(self):
+        """Thực hiện bước 1 thủ công"""
+        self.create_manual_monitor()
+        threading.Thread(target=self._run_manual_step1, daemon=True).start()
+
+    def _run_manual_step1(self):
+        try:
+            self.log("\n" + "=" * 50)
+            self.log("🎯 Thực hiện Bước 1 thủ công...")
+
+            # Tìm text trước
+            if self.monitor.search_text_in_screen():
+                self.monitor.step1_click_treasure()
+            else:
+                self.log("⚠️  Không tìm thấy text target trên màn hình")
+        except Exception as e:
+            self.log(f"❌ Lỗi: {e}")
+
+    def manual_step2(self):
+        """Thực hiện bước 2 thủ công"""
+        self.create_manual_monitor()
+        threading.Thread(target=self._run_manual_step2, daemon=True).start()
+
+    def _run_manual_step2(self):
+        try:
+            self.log("\n" + "=" * 50)
+            self.monitor.step2_click_center()
+        except Exception as e:
+            self.log(f"❌ Lỗi: {e}")
+
+    def manual_step3(self):
+        """Thực hiện bước 3 thủ công"""
+        self.create_manual_monitor()
+        threading.Thread(target=self._run_manual_step3, daemon=True).start()
+
+    def _run_manual_step3(self):
+        try:
+            self.log("\n" + "=" * 50)
+            self.monitor.step3_verify_and_click()
+        except Exception as e:
+            self.log(f"❌ Lỗi: {e}")
+
+    def manual_step4(self):
+        """Thực hiện bước 4 thủ công"""
+        self.create_manual_monitor()
+        threading.Thread(target=self._run_manual_step4, daemon=True).start()
+
+    def _run_manual_step4(self):
+        try:
+            self.log("\n" + "=" * 50)
+            self.monitor.step4_verify_and_click()
+        except Exception as e:
+            self.log(f"❌ Lỗi: {e}")
+
+    def manual_step5(self):
+        """Thực hiện bước 5 thủ công"""
+        self.create_manual_monitor()
+        threading.Thread(target=self._run_manual_step5, daemon=True).start()
+
+    def _run_manual_step5(self):
+        try:
+            self.log("\n" + "=" * 50)
+            self.monitor.step5_auto_click()
+        except Exception as e:
+            self.log(f"❌ Lỗi: {e}")
+
+    def manual_reset(self):
+        """Thực hiện reset thủ công"""
+        self.create_manual_monitor()
+        threading.Thread(target=self._run_manual_reset, daemon=True).start()
+
+    def _run_manual_reset(self):
+        try:
+            self.log("\n" + "=" * 50)
+            self.monitor.click_back_and_restart()
+        except Exception as e:
+            self.log(f"❌ Lỗi: {e}")
 
 
 class TextRedirector:

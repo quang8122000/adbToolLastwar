@@ -9,15 +9,26 @@ import subprocess
 import time
 import os
 import re
+import threading
 from datetime import datetime
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageEnhance
     import pytesseract
+    import numpy as np
 
     OCR_AVAILABLE = True
+    NUMPY_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
+    NUMPY_AVAILABLE = False
+
+try:
+    import numpy as np
+
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
 
 
 class GameMonitor:
@@ -29,6 +40,8 @@ class GameMonitor:
         debug=False,
         auto_click=False,
         click_delay=0.3,
+        click_speed=0.07,
+        click_duration=10,
         skip_color_check=False,
         ocr_region=None,
         pixel_patterns=None,
@@ -48,6 +61,8 @@ class GameMonitor:
         self.auto_click = auto_click
         self.last_found_coords = None
         self.click_delay = click_delay  # Thời gian delay giữa các lần click
+        self.click_speed = click_speed  # Tốc độ click (interval giữa các lần click)
+        self.click_duration = click_duration  # Thời gian click liên tục ở bước 5
         self.cached_screenshot = None  # Cache screenshot để không phải chụp lại
         self.skip_color_check = skip_color_check  # Bỏ qua kiểm tra màu
         self.ocr_region = (
@@ -59,6 +74,7 @@ class GameMonitor:
             pattern_match_ratio  # Tỷ lệ pixel khớp tối thiểu (0.0-1.0)
         )
         self.stop_requested = False  # Flag để dừng monitor từ GUI
+        self._pattern_rgb_cache = {}  # Cache RGB values của patterns
 
     def parse_dimension(self, value, total):
         """Parse dimension value - hỗ trợ % và px
@@ -195,19 +211,86 @@ class GameMonitor:
                 crop_offset_x = 0
                 crop_offset_y = 0
 
-            # Resize 50% để cân bằng tốc độ và độ chính xác
+            # Không resize để giữ nguyên chi tiết (ưu tiên độ chính xác hơn tốc độ)
             crop_width, crop_height = img_crop.size
-            img_resized = img_crop.resize(
-                (crop_width // 2, crop_height // 2), Image.Resampling.LANCZOS
-            )
+            img_resized = img_crop  # Giữ nguyên kích thước gốc
 
-            # Nhận dạng text từ ảnh đã crop và resize
-            data = pytesseract.image_to_data(
-                img_resized, lang="eng", output_type=pytesseract.Output.DICT
-            )
+            # Preprocessing để cải thiện OCR
+            # 1. Chuyển sang grayscale
+            img_gray = img_resized.convert("L")
 
-            # Lấy toàn bộ text để kiểm tra
-            text = pytesseract.image_to_string(img_resized, lang="eng")
+            # 2. Tăng contrast
+            if NUMPY_AVAILABLE:
+                img_array = np.array(img_gray)
+                # Simple contrast enhancement: clip and normalize
+                img_array = np.clip(img_array * 1.2, 0, 255).astype(np.uint8)
+                img_enhanced = Image.fromarray(img_array)
+            else:
+                # Fallback: dùng ImageEnhance nếu không có numpy
+                enhancer = ImageEnhance.Contrast(img_gray)
+                img_enhanced = enhancer.enhance(1.5)
+
+            # 3. Sharpen để làm rõ text
+            sharpener = ImageEnhance.Sharpness(img_enhanced)
+            img_final = sharpener.enhance(2.0)
+
+            # Debug: Lưu ảnh preprocessing để kiểm tra
+            if self.debug:
+                try:
+                    img_final.save("/tmp/ocr_preprocessed.png")
+                    print(
+                        f"[DEBUG] Đã lưu ảnh preprocessing tại: /tmp/ocr_preprocessed.png"
+                    )
+                except:
+                    pass
+
+            # Tesseract config tối ưu cho text detection
+            # Thử nhiều PSM modes để tăng khả năng nhận diện
+            psm_modes = [
+                ("--oem 3 --psm 6", "Single uniform block"),  # Phù hợp nhất cho UI game
+                ("--oem 3 --psm 11", "Sparse text"),  # Backup: text rải rác
+                ("--oem 3 --psm 3", "Fully automatic"),  # Fallback: tự động
+            ]
+
+            text = ""
+            data = None
+
+            for tesseract_config, mode_desc in psm_modes:
+                # Nhận dạng text từ ảnh đã preprocessing
+                try:
+                    text_temp = pytesseract.image_to_string(
+                        img_final, lang="eng", config=tesseract_config
+                    )
+
+                    # Kiểm tra xem có tìm thấy target text không
+                    found_any = any(
+                        target.lower() in text_temp.lower()
+                        for target in self.target_texts
+                    )
+
+                    if (
+                        found_any or not text
+                    ):  # Dùng result này nếu tìm thấy hoặc chưa có result nào
+                        text = text_temp
+                        data = pytesseract.image_to_data(
+                            img_final,
+                            lang="eng",
+                            config=tesseract_config,
+                            output_type=pytesseract.Output.DICT,
+                        )
+
+                        if self.debug:
+                            print(
+                                f"[DEBUG] Sử dụng PSM mode: {mode_desc} ({tesseract_config})"
+                            )
+
+                        if found_any:
+                            break  # Đã tìm thấy, không cần thử mode khác
+
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Lỗi khi OCR với mode {mode_desc}: {e}")
+                    continue
 
             # Tìm tọa độ cho tất cả target texts
             for target in self.target_texts:
@@ -216,10 +299,10 @@ class GameMonitor:
                     # Tính toạ độ cho text này
                     coords = self.find_text_coordinates_for_target(data, target)
                     if coords:
-                        # Scale lại tọa độ: nhân 2 (do resize 50%) và cộng offset (do crop)
+                        # Không cần scale vì không resize nữa, chỉ cần cộng offset (do crop)
                         self.last_found_coords = (
-                            coords[0] * 2 + crop_offset_x,
-                            coords[1] * 2 + crop_offset_y,
+                            coords[0] + crop_offset_x,
+                            coords[1] + crop_offset_y,
                         )
                         break
 
@@ -337,24 +420,26 @@ class GameMonitor:
             return None
 
     def check_pixel_pattern(self, pattern_name, tolerance=None):
-        """Kiểm tra pixel pattern có khớp không
+        """Kiểm tra pixel pattern có khớp không - OPTIMIZED VERSION
 
         Args:
             pattern_name: Tên pattern cần check (vd: 'step3', 'step4')
             tolerance: Độ sai lệch màu cho phép (0-255), None = dùng self.pattern_tolerance
 
         Returns:
-            True nếu pattern khớp, False nếu không
+            Tuple (is_match, match_ratio)
         """
         if not self.pixel_patterns or pattern_name not in self.pixel_patterns:
+            print(f"⚠️  CẢNH BÁO: Không tìm thấy pattern '{pattern_name}' trong config!")
             if self.debug:
-                print(f"[DEBUG] Không tìm thấy pattern '{pattern_name}'")
-            return True  # Nếu không có pattern thì coi như pass
+                print(f"[DEBUG] Available patterns: {list(self.pixel_patterns.keys())}")
+            return False, 0.0  # Return False khi không tìm thấy pattern
 
         if tolerance is None:
             tolerance = self.pattern_tolerance
 
         pattern = self.pixel_patterns[pattern_name]
+        total_pixels = len(pattern)
 
         # Chụp screenshot mới nếu chưa có cache
         if not self.cached_screenshot:
@@ -365,46 +450,119 @@ class GameMonitor:
             self.cached_screenshot = Image.open("/tmp/screenshot.png")
 
         img = self.cached_screenshot
-        matched_pixels = 0
-        total_pixels = len(pattern)
 
-        for pixel_info in pattern:
-            x, y = pixel_info["coord"]
-            expected_color = pixel_info["color"]
-
-            try:
-                # Lấy màu thực tế
-                actual_pixel = img.getpixel((x, y))
-                actual_color = "#{:02x}{:02x}{:02x}".format(
-                    actual_pixel[0], actual_pixel[1], actual_pixel[2]
-                ).upper()
-
-                # Chuyển hex sang RGB để so sánh
-                expected_r = int(expected_color[1:3], 16)
-                expected_g = int(expected_color[3:5], 16)
-                expected_b = int(expected_color[5:7], 16)
-
-                # Tính độ sai khác
-                diff = (
-                    abs(actual_pixel[0] - expected_r)
-                    + abs(actual_pixel[1] - expected_g)
-                    + abs(actual_pixel[2] - expected_b)
+        # ⚡ OPTIMIZATION 1: Parse tất cả expected RGB một lần và cache
+        cache_key = pattern_name
+        if cache_key not in self._pattern_rgb_cache:
+            self._pattern_rgb_cache[cache_key] = [
+                (
+                    p["coord"],
+                    int(p["color"][1:3], 16),
+                    int(p["color"][3:5], 16),
+                    int(p["color"][5:7], 16),
+                    p["color"],
                 )
+                for p in pattern
+            ]
 
-                if diff <= tolerance * 3:  # tolerance cho 3 kênh màu
-                    matched_pixels += 1
+        cached_pattern = self._pattern_rgb_cache[cache_key]
+
+        # ⚡ OPTIMIZATION 2: Dùng numpy nếu có (nhanh hơn 3-5x)
+        if NUMPY_AVAILABLE:
+            # Convert image sang numpy array một lần
+            img_array = np.array(img)
+            matched_pixels = 0
+
+            # Early stopping threshold
+            min_required_matches = int(total_pixels * self.pattern_match_ratio)
+            max_allowed_failures = total_pixels - min_required_matches
+            failed_pixels = 0
+
+            for coord, exp_r, exp_g, exp_b, exp_color in cached_pattern:
+                x, y = coord
+
+                # ⚡ OPTIMIZATION 3: Early stopping
+                if failed_pixels > max_allowed_failures:
                     if self.debug:
                         print(
-                            f"[DEBUG] ✅ Pixel ({x},{y}): {actual_color} ≈ {expected_color} (diff={diff})"
+                            f"[DEBUG] ⚡ Early stop: Quá nhiều pixel fail ({failed_pixels}/{max_allowed_failures})"
                         )
-                else:
+                    break
+
+                try:
+                    # Lấy màu từ numpy array (nhanh hơn getpixel)
+                    actual_r, actual_g, actual_b = img_array[y, x, :3]
+
+                    # Tính độ sai khác
+                    diff = (
+                        abs(int(actual_r) - exp_r)
+                        + abs(int(actual_g) - exp_g)
+                        + abs(int(actual_b) - exp_b)
+                    )
+
+                    if diff <= tolerance * 3:
+                        matched_pixels += 1
+                        if self.debug:
+                            actual_color = (
+                                f"#{actual_r:02x}{actual_g:02x}{actual_b:02x}".upper()
+                            )
+                            print(
+                                f"[DEBUG] ✅ Pixel ({x},{y}): {actual_color} ≈ {exp_color} (diff={diff})"
+                            )
+                    else:
+                        failed_pixels += 1
+                        if self.debug:
+                            actual_color = (
+                                f"#{actual_r:02x}{actual_g:02x}{actual_b:02x}".upper()
+                            )
+                            print(
+                                f"[DEBUG] ❌ Pixel ({x},{y}): {actual_color} ≠ {exp_color} (diff={diff})"
+                            )
+                except Exception as e:
+                    failed_pixels += 1
                     if self.debug:
-                        print(
-                            f"[DEBUG] ❌ Pixel ({x},{y}): {actual_color} ≠ {expected_color} (diff={diff})"
-                        )
-            except Exception as e:
-                if self.debug:
-                    print(f"[DEBUG] ⚠️  Lỗi khi check pixel ({x},{y}): {e}")
+                        print(f"[DEBUG] ⚠️  Lỗi khi check pixel ({x},{y}): {e}")
+        else:
+            # Fallback: Dùng PIL getpixel (chậm hơn)
+            matched_pixels = 0
+            min_required_matches = int(total_pixels * self.pattern_match_ratio)
+            max_allowed_failures = total_pixels - min_required_matches
+            failed_pixels = 0
+
+            for coord, exp_r, exp_g, exp_b, exp_color in cached_pattern:
+                x, y = coord
+
+                if failed_pixels > max_allowed_failures:
+                    break
+
+                try:
+                    actual_pixel = img.getpixel((x, y))
+                    actual_color = "#{:02x}{:02x}{:02x}".format(
+                        actual_pixel[0], actual_pixel[1], actual_pixel[2]
+                    ).upper()
+
+                    diff = (
+                        abs(actual_pixel[0] - exp_r)
+                        + abs(actual_pixel[1] - exp_g)
+                        + abs(actual_pixel[2] - exp_b)
+                    )
+
+                    if diff <= tolerance * 3:
+                        matched_pixels += 1
+                        if self.debug:
+                            print(
+                                f"[DEBUG] ✅ Pixel ({x},{y}): {actual_color} ≈ {exp_color} (diff={diff})"
+                            )
+                    else:
+                        failed_pixels += 1
+                        if self.debug:
+                            print(
+                                f"[DEBUG] ❌ Pixel ({x},{y}): {actual_color} ≠ {exp_color} (diff={diff})"
+                            )
+                except Exception as e:
+                    failed_pixels += 1
+                    if self.debug:
+                        print(f"[DEBUG] ⚠️  Lỗi khi check pixel ({x},{y}): {e}")
 
         # Dùng match_ratio từ config
         match_ratio = matched_pixels / total_pixels
@@ -415,13 +573,94 @@ class GameMonitor:
                 f"[DEBUG] Pattern '{pattern_name}': {matched_pixels}/{total_pixels} pixels khớp ({match_ratio*100:.1f}%) -> {'✅ PASS' if is_match else '❌ FAIL'}"
             )
 
-        return is_match
+        return is_match, match_ratio
 
     def click_at_coordinates(self, x, y):
         """Click vào tọa độ trên màn hình"""
         cmd = f"adb shell input tap {x} {y}"
         self.run_adb_command(cmd)
         print(f"👆 Đã click vào tọa độ ({x}, {y})")
+
+    def smart_verify_pattern(self, pattern_name, max_delay=0.3):
+        """Smart Adaptive Verification - Tự động quyết định số lần verify dựa trên match ratio
+
+        Logic:
+        - Match ratio >= 95%: Chỉ cần 1 lần check (rất chắc chắn)
+        - Match ratio 80-95%: Verify 2 lần với delay 0.1s (khá chắc chắn)
+        - Match ratio < 80%: Verify 3 lần với delay 0.15s (không chắc chắn)
+
+        Args:
+            pattern_name: Tên pattern cần check
+            max_delay: Delay tối đa giữa các lần check (mặc định 0.3s)
+
+        Returns:
+            True nếu pattern ổn định, False nếu không
+        """
+        # Chụp screenshot lần đầu
+        self.cached_screenshot = None
+        self.run_adb_command("adb shell screencap -p /sdcard/screenshot.png")
+        self.run_adb_command(
+            "adb pull /sdcard/screenshot.png /tmp/screenshot.png 2>/dev/null"
+        )
+        self.cached_screenshot = Image.open("/tmp/screenshot.png")
+
+        # Check lần đầu và lấy match_ratio
+        is_match, match_ratio = self.check_pixel_pattern(pattern_name)
+
+        if not is_match:
+            if self.debug:
+                print(f"[DEBUG] 🔴 Lần 1: Không khớp ({match_ratio*100:.1f}%)")
+            return False
+
+        # Quyết định số lần verify dựa trên match_ratio
+        if match_ratio >= 0.95:
+            # Rất chắc chắn - chỉ cần 1 lần
+            if self.debug:
+                print(
+                    f"[DEBUG] 🟢 Match ratio cao ({match_ratio*100:.1f}%) - Chỉ cần 1 lần check"
+                )
+            return True
+
+        elif match_ratio >= 0.80:
+            # Khá chắc chắn - verify 2 lần
+            num_checks = 2
+            delay = 0.1
+            if self.debug:
+                print(
+                    f"[DEBUG] 🟡 Match ratio trung bình ({match_ratio*100:.1f}%) - Verify {num_checks} lần"
+                )
+        else:
+            # Không chắc chắn - verify 3 lần
+            num_checks = 3
+            delay = 0.15
+            if self.debug:
+                print(
+                    f"[DEBUG] 🟠 Match ratio thấp ({match_ratio*100:.1f}%) - Verify {num_checks} lần"
+                )
+
+        # Verify thêm (num_checks - 1) lần nữa
+        for i in range(1, num_checks):
+            time.sleep(delay)
+
+            # Chụp screenshot mới
+            self.cached_screenshot = None
+            self.run_adb_command("adb shell screencap -p /sdcard/screenshot.png")
+            self.run_adb_command(
+                "adb pull /sdcard/screenshot.png /tmp/screenshot.png 2>/dev/null"
+            )
+            self.cached_screenshot = Image.open("/tmp/screenshot.png")
+
+            # Check
+            is_match, match_ratio = self.check_pixel_pattern(pattern_name)
+            if not is_match:
+                if self.debug:
+                    print(f"[DEBUG] 🔴 Lần {i+1}: Không khớp ({match_ratio*100:.1f}%)")
+                return False
+
+            if self.debug:
+                print(f"[DEBUG] 🟢 Lần {i+1}: Khớp ({match_ratio*100:.1f}%)")
+
+        return True
 
     def stop(self):
         """Yêu cầu dừng monitor"""
@@ -440,123 +679,103 @@ class GameMonitor:
         self.click_at_coordinates(537, 1910)
         print(f"✅ Đã reset, sẵn sàng chạy lại từ bước 1\n")
 
-    def execute_click_sequence(self):
-        """Thực hiện chuỗi click theo thứ tự"""
-        # Bắt đầu đếm thời gian
-        start_time = time.time()
-
-        # Bước 1: Click vào text "Dig Up Treasure" (dùng OCR)
+    def step1_click_treasure(self):
+        """Bước 1: Click vào text 'Dig Up Treasure'"""
         if self.last_found_coords:
             x, y = self.last_found_coords
             print(f"🎯 Bước 1: Click vào '{self.target_text}'...")
             time.sleep(self.click_delay)
             self.click_at_coordinates(x, y)
-            time.sleep(self.click_delay * 2)  # Đợi UI phản hồi
+            time.sleep(self.click_delay * 2)
+            return True
+        else:
+            print(f"⚠️  Không tìm thấy tọa độ để click")
+            return False
 
-        # Check stop request
-        if self.stop_requested:
-            print("\n🛑 Nhận lệnh dừng sau Bước 1")
-            return
-
-        # Bước 2: Click vào tọa độ giữa màn hình (536, 976)
-        print(f"\n🎯 Bước 2: Click vào tọa độ giữa màn hình...")
+    def step2_click_center(self):
+        """Bước 2: Click vào tọa độ giữa màn hình"""
+        print(f"🎯 Bước 2: Click vào tọa độ giữa màn hình...")
         time.sleep(self.click_delay)
-        self.click_at_coordinates(536, 976)
-        time.sleep(self.click_delay * 2)  # Đợi UI phản hồi
+        self.click_at_coordinates(514, 819)
+        time.sleep(self.click_delay * 2)
+        return True
 
-        # Check stop request
-        if self.stop_requested:
-            print("\n🛑 Nhận lệnh dừng sau Bước 2")
-            return
-
-        # Bước 3: Kiểm tra pixel pattern trước khi click (550, 1136)
-        print(f"\n🔍 Bước 3: Kiểm tra pixel pattern tại (550, 1136)...")
+    def step3_verify_and_click(self):
+        """Bước 3: Kiểm tra pixel pattern và click (550, 1136)"""
+        print(f"🔍 Bước 3: Kiểm tra pixel pattern tại (550, 1136) (Smart Verify)...")
         time.sleep(self.click_delay)
 
-        # Chụp screenshot mới cho bước này (sau khi đã click bước 2)
-        self.cached_screenshot = None  # Clear cache để chụp lại
-        self.run_adb_command("adb shell screencap -p /sdcard/screenshot.png")
-        self.run_adb_command(
-            "adb pull /sdcard/screenshot.png /tmp/screenshot.png 2>/dev/null"
-        )
-        self.cached_screenshot = Image.open("/tmp/screenshot.png")
+        # Chọn pattern dựa trên target_text
+        if "Test Flight" in self.target_text:
+            pattern_name = "step3_test"
+        elif any(
+            word in self.target_text for word in ["Wondrous", "Christmas", "Party"]
+        ):
+            pattern_name = "step3_tiec"
+        else:
+            pattern_name = "step3_dig"
 
-        # Kiểm tra pixel pattern
-        if self.check_pixel_pattern("step3"):
-            print(f"✅ Pixel pattern khớp! Click vào (550, 1136)...")
+        # Kiểm tra pattern có tồn tại không
+        if pattern_name not in self.pixel_patterns:
+            print(f"⚠️  Pattern '{pattern_name}' không tồn tại trong config!")
+            # Thử dùng pattern còn lại
+            fallback = "step3_dig" if pattern_name == "step3_test" else "step3_test"
+            if fallback in self.pixel_patterns:
+                print(f"🔄 Thử dùng pattern fallback: '{fallback}'")
+                pattern_name = fallback
+            else:
+                print(f"❌ Không có pattern nào cho bước 3. Bỏ qua verify.")
+                return False
+
+        if self.smart_verify_pattern(pattern_name):
+            print(f"✅ Pattern ổn định! Click vào (550, 1136)...")
             time.sleep(self.click_delay)
             self.click_at_coordinates(550, 1136)
+            time.sleep(self.click_delay * 2)
+            return True
         else:
-            print(f"⚠️  Pixel pattern không khớp. Bỏ qua bước 3 và 4.")
-            self.click_back_and_restart()
-            return
+            print(f"⚠️  Pattern không ổn định (có thể bị nhiễu UI).")
+            return False
 
-        # Đợi UI phản hồi
-        time.sleep(self.click_delay * 2)
+    def step4_verify_and_click(self):
+        """Bước 4: Kiểm tra pixel pattern và click (538, 1470)"""
+        print(f"🔍 Bước 4: Kiểm tra pixel pattern tại (538, 1470) (Smart Verify)...")
 
-        # Check stop request
-        if self.stop_requested:
-            print("\n🛑 Nhận lệnh dừng sau Bước 3")
-            return
-
-        # Bước 4: Kiểm tra pixel pattern trước khi click (538, 1470) với retry
-        print(f"\n🔍 Bước 4: Kiểm tra pixel pattern tại (538, 1470)...")
-
-        max_retries = 2  # Thử tối đa 2 lần
-        step4_success = False
-
+        max_retries = 2
         for attempt in range(max_retries):
-            # Check stop request
             if self.stop_requested:
-                print("\n🛑 Nhận lệnh dừng tại Bước 4")
-                return
+                return False
+
             if attempt > 0:
                 print(f"🔄 Thử lại lần {attempt + 1}/{max_retries}...")
-                time.sleep(0.5)  # Đợi UI ổn định
+                time.sleep(0.5)
 
-            # Chụp screenshot mới cho bước 4
-            self.cached_screenshot = None
-            self.run_adb_command("adb shell screencap -p /sdcard/screenshot.png")
-            self.run_adb_command(
-                "adb pull /sdcard/screenshot.png /tmp/screenshot.png 2>/dev/null"
-            )
-            self.cached_screenshot = Image.open("/tmp/screenshot.png")
-
-            # Kiểm tra pixel pattern
-            if self.check_pixel_pattern("step4"):
-                print(f"✅ Pixel pattern khớp! Click vào (538, 1470)...")
+            if self.smart_verify_pattern("step4"):
+                print(f"✅ Pattern ổn định! Click vào (538, 1470)...")
                 time.sleep(self.click_delay)
                 self.click_at_coordinates(538, 1470)
-                step4_success = True
-                break
+                time.sleep(self.click_delay * 2)
+                return True
 
-        if not step4_success:
-            elapsed_time = time.time() - start_time
-            print(
-                f"⚠️  Pixel pattern không khớp sau {max_retries} lần thử. Bỏ qua bước 4 và 5."
-            )
-            print(f"⏱️  Thời gian đã thực hiện: {elapsed_time:.2f}s")
-            self.click_back_and_restart()
-            return
+        print(f"⚠️  Pixel pattern không khớp sau {max_retries} lần thử.")
+        return False
 
-        # Đợi UI phản hồi
-        time.sleep(self.click_delay * 2)
+    def step5_auto_click(self):
+        """Bước 5: Kiểm tra pixel pattern và auto-click liên tục cho đến khi quà xuất hiện"""
+        print(f"🔍 Bước 5: Kiểm tra pixel pattern tại (514, 819)...")
+        print(
+            f"⏰  Sẽ click liên tục và kiểm tra đến khi quà xuất hiện (timeout: 10 phút)..."
+        )
 
-        # Bước 5: Kiểm tra pixel pattern và auto-click vào (544, 876) - CHỜ TỐI ĐA 10 PHÚT
-        print(f"\n🔍 Bước 5: Kiểm tra pixel pattern tại (514, 819)...")
-        print(f"⏰  Sẽ kiểm tra liên tục trong vòng 10 phút...")
-
-        max_wait_time = 600  # 10 phút = 600 giây
-        check_interval = 1.5  # Kiểm tra mỗi 1.5 giây
+        max_wait_time = 600  # 10 phút
+        check_interval = 1.5
         step5_start_time = time.time()
-        step5_success = False
         attempt = 0
 
         while time.time() - step5_start_time < max_wait_time:
-            # Check stop request
             if self.stop_requested:
-                print("\n🛑 Nhận lệnh dừng tại Bước 5 (đang chờ pixel pattern)")
-                return
+                print("\n🛑 Nhận lệnh dừng tại Bước 5")
+                return False
 
             attempt += 1
             elapsed_step5 = time.time() - step5_start_time
@@ -567,64 +786,168 @@ class GameMonitor:
                     f"🔄 Lần thử #{attempt} - Còn {remaining_time:.0f}s (đã chờ {elapsed_step5:.0f}s)..."
                 )
 
-            # Chụp screenshot mới cho bước 5
-            self.cached_screenshot = None
-            self.run_adb_command("adb shell screencap -p /sdcard/screenshot.png")
-            self.run_adb_command(
-                "adb pull /sdcard/screenshot.png /tmp/screenshot.png 2>/dev/null"
-            )
-            self.cached_screenshot = Image.open("/tmp/screenshot.png")
-
-            # Kiểm tra pixel pattern
-            if self.check_pixel_pattern("step5"):
+            if self.smart_verify_pattern("step5"):
                 print(
-                    f"✅ Pixel pattern khớp sau {attempt} lần thử ({elapsed_step5:.1f}s)!"
+                    f"✅ Pattern ổn định sau {attempt} lần thử ({elapsed_step5:.1f}s)!"
                 )
-                print(
-                    f"🎯 Auto-click liên tục vào (544, 876) trong 10 giây (mỗi 70ms)..."
-                )
+                print(f"🎯 Bắt đầu click liên tục cho đến khi quà xuất hiện...")
 
-                # Click liên tục trong 10 giây với tốc độ 70ms/lần
                 click_start_time = time.time()
-                click_duration = 10  # 10 giây
-                click_interval = 0.07  # 70 mili giây
-                click_count = 0
+                click_interval = self.click_speed
+                click_count = {"value": 0}  # Dùng dict để share giữa threads
+                should_stop_clicking = {"value": False}  # Flag để dừng click thread
+                gift_appeared = {"value": False}  # Flag đánh dấu quà đã xuất hiện
 
-                while time.time() - click_start_time < click_duration:
-                    # Check stop request
-                    if self.stop_requested:
-                        print(
-                            f"\n🛑 Nhận lệnh dừng tại Bước 5 (đã click {click_count} lần)"
-                        )
-                        return
+                # Thread 1: Click liên tục không nghỉ
+                def click_continuously():
+                    while not should_stop_clicking["value"]:
+                        if self.stop_requested:
+                            should_stop_clicking["value"] = True
+                            return
 
-                    self.click_at_coordinates(544, 876)
-                    click_count += 1
-                    time.sleep(click_interval)
+                        if time.time() - step5_start_time > max_wait_time:
+                            should_stop_clicking["value"] = True
+                            return
 
-                print(f"✅ Đã click {click_count} lần trong {click_duration}s")
+                        self.click_at_coordinates(514, 819)
+                        click_count["value"] += 1
 
-                # Tính thời gian hoàn thành
-                elapsed_time = time.time() - start_time
-                print(f"\n🎉 Hoàn thành toàn bộ chuỗi hành động!")
-                print(f"⏱️  Tổng thời gian: {elapsed_time:.2f}s")
+                        # Hiển thị progress mỗi 20 lần click
+                        if click_count["value"] % 20 == 0:
+                            elapsed_click = time.time() - click_start_time
+                            print(
+                                f"⚡ Đã click {click_count['value']} lần ({elapsed_click:.1f}s)..."
+                            )
 
-                # Click 2 lần để reset và chuẩn bị chạy lại
-                self.click_back_and_restart()
+                        time.sleep(click_interval)
 
-                step5_success = True
-                break
+                # Thread 2: Kiểm tra pattern định kỳ
+                def check_pattern_periodically():
+                    check_every_seconds = 2.0
+                    last_check_time = time.time()
 
-            # Đợi trước khi thử lại
+                    while not should_stop_clicking["value"]:
+                        current_time = time.time()
+
+                        if current_time - last_check_time >= check_every_seconds:
+                            elapsed_click = current_time - click_start_time
+                            print(
+                                f"🔍 Kiểm tra xem quà đã xuất hiện chưa (đã click {click_count['value']} lần, {elapsed_click:.1f}s)..."
+                            )
+
+                            try:
+                                # Clear cache để chụp screenshot mới
+                                self.cached_screenshot = None
+
+                                # Kiểm tra xem pattern step5 còn không
+                                is_match, match_ratio = self.check_pixel_pattern(
+                                    "step5"
+                                )
+
+                                if not is_match:
+                                    # Pattern biến mất = màn hình đã chuyển = quà đã xuất hiện!
+                                    elapsed_total = time.time() - click_start_time
+                                    print(
+                                        f"✅ Quà đã xuất hiện! Đã click {click_count['value']} lần trong {elapsed_total:.1f}s"
+                                    )
+                                    gift_appeared["value"] = True
+                                    should_stop_clicking["value"] = True
+                                    return
+                                else:
+                                    # Pattern vẫn còn = vẫn đang đếm ngược, tiếp tục click
+                                    print(
+                                        f"⏳ Vẫn đang đếm ngược (pattern match: {match_ratio*100:.0f}%), tiếp tục click..."
+                                    )
+
+                            except Exception as e:
+                                # Nếu lỗi khi check, không dừng mà tiếp tục
+                                print(f"⚠️  Lỗi khi kiểm tra pattern: {e}")
+                                print(
+                                    f"   → Tiếp tục click, sẽ thử kiểm tra lại sau {check_every_seconds}s..."
+                                )
+
+                            last_check_time = current_time
+
+                        time.sleep(0.1)  # Check mỗi 0.1s xem đã đến giờ check chưa
+
+                # Bắt đầu cả 2 threads
+                click_thread = threading.Thread(target=click_continuously, daemon=True)
+                check_thread = threading.Thread(
+                    target=check_pattern_periodically, daemon=True
+                )
+
+                click_thread.start()
+                check_thread.start()
+
+                # Đợi cả 2 threads hoàn thành
+                click_thread.join()
+                check_thread.join()
+
+                # Kiểm tra kết quả
+                if gift_appeared["value"]:
+                    return True
+                elif self.stop_requested:
+                    print(f"\n🛑 Nhận lệnh dừng (đã click {click_count['value']} lần)")
+                    return False
+                else:
+                    print(
+                        f"\n⏰ Timeout sau {max_wait_time}s (đã click {click_count['value']} lần)"
+                    )
+                    return False
+
             time.sleep(check_interval)
 
-        if not step5_success:
+        print(f"⚠️  Pixel pattern không khớp sau {attempt} lần thử ({max_wait_time}s).")
+        return False
+
+    def execute_click_sequence(self):
+        """Thực hiện chuỗi click theo thứ tự"""
+        start_time = time.time()
+
+        # Bước 1
+        if not self.step1_click_treasure():
+            return
+        if self.stop_requested:
+            print("\n🛑 Nhận lệnh dừng sau Bước 1")
+            return
+
+        # Bước 2
+        print()
+        self.step2_click_center()
+        if self.stop_requested:
+            print("\n🛑 Nhận lệnh dừng sau Bước 2")
+            return
+
+        # Bước 3
+        print()
+        if not self.step3_verify_and_click():
+            print(f"Bỏ qua bước 3 và 4.")
+            self.click_back_and_restart()
+            return
+        if self.stop_requested:
+            print("\n🛑 Nhận lệnh dừng sau Bước 3")
+            return
+
+        # Bước 4
+        print()
+        if not self.step4_verify_and_click():
             elapsed_time = time.time() - start_time
-            print(
-                f"⚠️  Pixel pattern không khớp sau {attempt} lần thử ({max_wait_time}s). Bỏ qua bước 5."
-            )
+            print(f"Bỏ qua bước 4 và 5.")
             print(f"⏱️  Thời gian đã thực hiện: {elapsed_time:.2f}s")
             self.click_back_and_restart()
+            return
+        if self.stop_requested:
+            print("\n🛑 Nhận lệnh dừng sau Bước 4")
+            return
+
+        # Bước 5
+        print()
+        self.step5_auto_click()
+        elapsed_time = time.time() - start_time
+        print(f"⏱️  Thời gian đã thực hiện: {elapsed_time:.2f}s")
+
+        # Reset về ban đầu sau khi hoàn thành bước 5 (dù thành công hay thất bại)
+        self.click_back_and_restart()
 
     def send_notification(self):
         """Gửi thông báo khi tìm thấy text"""
@@ -773,9 +1096,17 @@ def main():
     # ⭐ PIXEL PATTERNS - Định nghĩa các pixel đặc trưng cho mỗi bước
     # Để lấy pixel patterns: Bật DEBUG_MODE=True, chạy 1 lần, xem tọa độ, rồi dùng get_pixel_color()
     PIXEL_PATTERNS = {
-        "step3": [
+        "step3_dig": [  # Pattern cho "Dig Up Treasure"
             {"coord": (550, 1136), "color": "#FFFFFF"},  # Pixel chính
             {"coord": (545, 1136), "color": "#F8FBF9"},  # Trái
+        ],
+        "step3_test": [  # Pattern cho "Test Flight Failure"
+            {"coord": (550, 1136), "color": "#FFFFFF"},  # Pixel chính
+            {"coord": (545, 1136), "color": "#308E4D"},  # Trái (màu khác)
+        ],
+        "step3_tiec": [  # Pattern cho "Wondrous Christmas Party"
+            {"coord": (552, 1723), "color": "#FFFFFF"},  # Pixel chính
+            {"coord": (547, 1723), "color": "#FFFFFF"},  # Trái
         ],
         "step4": [
             {"coord": (538, 1470), "color": "#10B2FB"},  # Pixel chính
